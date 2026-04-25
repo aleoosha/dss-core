@@ -20,6 +20,9 @@ class DecisionEngine
         protected array $profiles
     ) {}
 
+    /**
+     * Entry point for evaluating system health and making a shedding decision.
+     */
     public function evaluate(NodeMetrics $metrics): DecisionResult
     {
         $maxShedding = new FixedPoint(0);
@@ -28,37 +31,28 @@ class DecisionEngine
 
         foreach ($this->profiles as $profile) {
             $currentValue = $this->extractValue($metrics, $profile->metricName);
-            $target = $profile->targetThreshold;
             $stateKey = "pid_state_{$profile->metricName}";
-            
             $history = $this->repository->getState($stateKey);
 
-            // 1. Normalization: Signal = Current / Target (1.0 means exactly at threshold)
-            $signal = $currentValue->divide($target);
-            $activationPoint = new FixedPoint(1000); // 1.0 representation
+            // 1. Calculate normalized error using pre-emptive wall logic
+            $error = $this->calculateNormalizedError($currentValue, $profile->targetThreshold);
 
-            if ($signal->isLessThan($activationPoint)) {
-                // System Safe: Reset calc state, but PRESERVE learned coefficients
+            // 2. Handle safety zone (Dead-zone)
+            if ($error->value === 0) {
                 $this->repository->saveState($stateKey, $this->resetState($now, $history, $profile));
                 continue;
             }
 
-            // 2. Error calculation (Normalized)
-            // If CPU is 12% and Target is 10% -> Signal is 1.2 -> Error is 0.2
-            $error = $signal->subtract($activationPoint);
-
-            // 3. Process PID
-            $activeSettings = $this->tuner->tune($profile->pidSettings, $error, $history);
-            $deltaTime = $history ? ($now - $history->timestampMs) : 1000;
-            $result = $this->calculator->calculate($error, $deltaTime, $history, $activeSettings);
-
+            // 3. Run PID cycle (Tuning + Calculation)
+            $result = $this->runPidCycle($error, $history, $profile, $now);
             $this->repository->saveState($stateKey, $result);
 
+            // 4. Update aggregate results
             if ($result->output->isGreaterThan($maxShedding)) {
                 $maxShedding = $result->output;
             }
 
-            if ($signal->isGreaterThan($activationPoint)) {
+            if ($currentValue->isGreaterThanOrEqual($profile->targetThreshold)) {
                 $alerts[] = $profile->metricName;
             }
         }
@@ -66,16 +60,56 @@ class DecisionEngine
         return new DecisionResult($maxShedding, $maxShedding, $alerts, $now);
     }
 
-    private function resetState(int $ms, ?FixedPidResult $history, MetricProfile $p): FixedPidResult {
+    /**
+     * Calculates error based on 90% pre-emptive activation point.
+     */
+    private function calculateNormalizedError(FixedPoint $current, FixedPoint $target): FixedPoint
+    {
+        $activationPoint = $target->multiply(FixedPoint::fromFloat(0.9));
+
+        if ($current->isLessThan($activationPoint)) {
+            return new FixedPoint(0);
+        }
+
+        $gap = $target->subtract($activationPoint);
+        if ($gap->value <= 0) {
+            $gap = new FixedPoint(1);
+        }
+
+        return $current->subtract($activationPoint)->divide($gap);
+    }
+
+    /**
+     * Executes tuning and PID calculation for a specific metric.
+     */
+    private function runPidCycle(FixedPoint $error, ?FixedPidResult $history, MetricProfile $profile, int $now): FixedPidResult
+    {
+        $activeSettings = $this->tuner->tune($profile->pidSettings, $error, $history);
+        $deltaTime = $history ? ($now - $history->timestampMs) : 1000;
+
+        return $this->calculator->calculate($error, $deltaTime, $history, $activeSettings);
+    }
+
+    /**
+     * Resets transient calculation values while preserving the "experience" (learned gains).
+     */
+    private function resetState(int $ms, ?FixedPidResult $history, MetricProfile $p): FixedPidResult
+    {
         $z = new FixedPoint(0);
         return new FixedPidResult(
-            $z, $z, $z, $ms, 
-            $history?->kp ?? $p->pidSettings->kp, 
-            $history?->ki ?? $p->pidSettings->ki, 
-            $history?->kd ?? $p->pidSettings->kd
+            output: $z,
+            lastError: $z,
+            integral: $z,
+            timestampMs: $ms,
+            kp: $history?->kp ?? $p->pidSettings->kp,
+            ki: $history?->ki ?? $p->pidSettings->ki,
+            kd: $history?->kd ?? $p->pidSettings->kd
         );
     }
 
+    /**
+     * Maps metric names to NodeMetrics properties.
+     */
     private function extractValue(NodeMetrics $m, string $key): FixedPoint
     {
         return match ($key) {
