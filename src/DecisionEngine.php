@@ -9,8 +9,13 @@ use Aleoosha\TauPid\Contracts\PidTunerInterface;
 use Aleoosha\TauPid\Contracts\PidStateRepositoryInterface;
 use Aleoosha\TauPid\Contracts\DTO\MetricProfile;
 use Aleoosha\TauPid\Contracts\DTO\FixedPidResult;
+use Aleoosha\TauPid\Contracts\DTO\PidSettings;
 use Aleoosha\Telemetry\Contracts\DTO\NodeMetrics;
 
+/**
+ * DecisionEngine - The central intelligence of the HiveMind system.
+ * Orchestrates metric evaluation, dynamic gain synthesis, and PID execution.
+ */
 class DecisionEngine
 {
     public function __construct(
@@ -21,7 +26,7 @@ class DecisionEngine
     ) {}
 
     /**
-     * Entry point for evaluating system health and making a shedding decision.
+     * Evaluates current node metrics and determines the global shedding rate.
      */
     public function evaluate(NodeMetrics $metrics): DecisionResult
     {
@@ -30,29 +35,29 @@ class DecisionEngine
         $now = (int)(microtime(true) * 1000);
 
         foreach ($this->profiles as $profile) {
-            $currentValue = $this->extractValue($metrics, $profile->metricName);
+            $current = $this->extractValue($metrics, $profile->metricName);
             $stateKey = "pid_state_{$profile->metricName}";
             $history = $this->repository->getState($stateKey);
 
-            // 1. Calculate normalized error using pre-emptive wall logic
-            $error = $this->calculateNormalizedError($currentValue, $profile->targetThreshold);
+            // 1. Calculate normalized error based on domain-specific activation margin
+            $error = $this->calculateError($current, $profile);
 
-            // 2. Handle safety zone (Dead-zone)
+            // 2. Handle safety zone: Reset "pain" (integral) while preserving "experience" (learned gains)
             if ($error->value === 0) {
-                $this->repository->saveState($stateKey, $this->resetState($now, $history, $profile));
+                $this->repository->saveState($stateKey, $this->coolDownState($now, $history, $profile));
                 continue;
             }
 
-            // 3. Run PID cycle (Tuning + Calculation)
-            $result = $this->runPidCycle($error, $history, $profile, $now);
+            // 3. Synthesize settings and execute the PID cycle
+            $result = $this->executeMetricCycle($error, $history, $profile, $now);
             $this->repository->saveState($stateKey, $result);
 
-            // 4. Update aggregate results
+            // 4. Update aggregate system state
             if ($result->output->isGreaterThan($maxShedding)) {
                 $maxShedding = $result->output;
             }
 
-            if ($currentValue->isGreaterThanOrEqual($profile->targetThreshold)) {
+            if ($current->isGreaterThanOrEqual($profile->targetThreshold)) {
                 $alerts[] = $profile->metricName;
             }
         }
@@ -61,11 +66,12 @@ class DecisionEngine
     }
 
     /**
-     * Calculates error based on 90% pre-emptive activation point.
+     * Normalizes the error signal relative to the activation margin (e.g., 90% of target).
      */
-    private function calculateNormalizedError(FixedPoint $current, FixedPoint $target): FixedPoint
+    private function calculateError(FixedPoint $current, MetricProfile $profile): FixedPoint
     {
-        $activationPoint = $target->multiply(FixedPoint::fromFloat(0.9));
+        $target = $profile->targetThreshold;
+        $activationPoint = $target->multiply(FixedPoint::fromFloat($profile->activationMargin));
 
         if ($current->isLessThan($activationPoint)) {
             return new FixedPoint(0);
@@ -76,24 +82,56 @@ class DecisionEngine
             $gap = new FixedPoint(1);
         }
 
+        // Returns error in range [0.0 - 1.0+] relative to the danger zone
         return $current->subtract($activationPoint)->divide($gap);
     }
 
     /**
-     * Executes tuning and PID calculation for a specific metric.
+     * Orchestrates the evolutionary tuning and PID calculation step.
      */
-    private function runPidCycle(FixedPoint $error, ?FixedPidResult $history, MetricProfile $profile, int $now): FixedPidResult
+    private function executeMetricCycle(FixedPoint $error, ?FixedPidResult $history, MetricProfile $profile, int $now): FixedPidResult
     {
-        $activeSettings = $this->tuner->tune($profile->pidSettings, $error, $history);
+        // Get initial gains from settling time or retrieve learned gains from history
+        $baseSettings = $this->generateBaseSettings($profile, $history);
+
+        // Adaptive step: let the tuner adjust gains based on current dynamics
+        $activeSettings = $this->tuner->tune($baseSettings, $error, $history);
+        
         $deltaTime = $history ? ($now - $history->timestampMs) : 1000;
 
+        // Mathematical step: compute control output
         return $this->calculator->calculate($error, $deltaTime, $history, $activeSettings);
     }
 
     /**
-     * Resets transient calculation values while preserving the "experience" (learned gains).
+     * Synthesizes PID gains based on the physical settling time of the process.
+     * Fast processes (CPU) get higher gains; slow processes (DB) get smoother gains.
      */
-    private function resetState(int $ms, ?FixedPidResult $history, MetricProfile $p): FixedPidResult
+    private function generateBaseSettings(MetricProfile $profile, ?FixedPidResult $history): PidSettings
+    {
+        // If history exists, prefer learned (evolved) coefficients
+        if ($history && $history->kp->value > 0) {
+            return new PidSettings($history->kp, $history->ki, $history->kd, FixedPoint::fromInt(1));
+        }
+
+        // Default synthesis rule: Kp = 10 / SettlingTime
+        $kpValue = 10.0 / max($profile->settlingTimeSeconds, 1);
+        $kiValue = $kpValue / 2.0;
+        $kdValue = $kpValue * 0.5;
+
+        return new PidSettings(
+            FixedPoint::fromFloat($kpValue),
+            FixedPoint::fromFloat($kiValue),
+            FixedPoint::fromFloat($kdValue),
+            FixedPoint::fromInt(1)
+        );
+    }
+
+    /**
+     * Wipes current error and integral state during safety periods 
+     * but prevents the engine from "forgetting" learned PID gains.
+     */
+    private function coolDownState(int $ms, ?FixedPidResult $history, MetricProfile $p): FixedPidResult
     {
         $z = new FixedPoint(0);
         return new FixedPidResult(
@@ -108,7 +146,7 @@ class DecisionEngine
     }
 
     /**
-     * Maps metric names to NodeMetrics properties.
+     * Resolves telemetry property based on the metric profile key.
      */
     private function extractValue(NodeMetrics $m, string $key): FixedPoint
     {
