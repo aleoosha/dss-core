@@ -7,6 +7,7 @@ use Aleoosha\Support\Types\FixedPoint;
 use Aleoosha\TauPid\Contracts\PidCalculatorInterface;
 use Aleoosha\TauPid\Contracts\PidTunerInterface;
 use Aleoosha\TauPid\Contracts\PidStateRepositoryInterface;
+use Aleoosha\TauPid\Contracts\DTO\FixedPidResult;
 use Aleoosha\TauPid\Contracts\DTO\MetricProfile;
 use Aleoosha\Telemetry\Contracts\DTO\NodeMetrics;
 
@@ -20,7 +21,7 @@ class DecisionEngine
         protected array $profiles
     ) {}
 
-    public function evaluate(NodeMetrics $metrics): DecisionResult
+    public function evaluate(NodeMetrics $metrics, ?FixedPidResult $previousState): DecisionResult
     {
         $maxShedding = FixedPoint::fromInt(0);
         $alerts = [];
