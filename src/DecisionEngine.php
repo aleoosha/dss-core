@@ -39,7 +39,7 @@ class DecisionEngine
             $previousState = $this->repository->getState($stateKey);
 
             // 1. Tuning
-            $activeSettings = $this->tuner->tune($profile->pidSettings, $currentValue);
+            $activeSettings = $this->tuner->tune($profile->pidSettings, $currentValue, $previousState);
 
             // 2. Calculation
             $deltaTime = $previousState ? ($now - $previousState->timestampMs) : 1000;

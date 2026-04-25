@@ -1,4 +1,4 @@
-# Resilience DSS Core
+# DSS Core
 
 **Decision Support System** (DSS) kernel for automated system resilience and load management.
 
